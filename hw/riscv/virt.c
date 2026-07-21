@@ -28,6 +28,7 @@
 #include "hw/core/sysbus.h"
 #include "hw/core/qdev-properties.h"
 #include "hw/char/serial-mm.h"
+#include "hw/char/pl011.h"
 #include "target/riscv/cpu.h"
 #include "hw/core/sysbus-fdt.h"
 #include "target/riscv/pmu.h"
@@ -93,6 +94,7 @@ static const MemMapEntry virt_memmap[] = {
     [VIRT_APLIC_M] =      {  0xc000000, APLIC_SIZE(VIRT_CPUS_MAX) },
     [VIRT_APLIC_S] =      {  0xd000000, APLIC_SIZE(VIRT_CPUS_MAX) },
     [VIRT_UART0] =        { 0x10000000,         0x100 },
+    [VIRT_UART1] =        { 0x10009000,        0x1000 },
     [VIRT_VIRTIO] =       { 0x10001000,        0x1000 },
     [VIRT_FW_CFG] =       { 0x10100000,          0x18 },
     [VIRT_FLASH] =        { 0x20000000,     0x4000000 },
@@ -972,6 +974,52 @@ static void create_fdt_uart(RISCVVirtState *s,
     qemu_fdt_setprop_string(ms->fdt, "/aliases", "serial0", name);
 }
 
+static void create_fdt_pl011(RISCVVirtState *s,
+                             uint32_t irq_mmio_phandle)
+{
+    g_autofree char *name = NULL;
+    g_autofree char *clk_name = NULL;
+    uint32_t clk_phandle;
+    MachineState *ms = MACHINE(s);
+    static const char compat[] = "arm,pl011\0arm,primecell";
+    static const char clocknames[] = "uartclk\0apb_pclk";
+
+    /*
+     * PL011 is added as a second, non-default UART (serial1) alongside the
+     * ns16550a UART0 which remains the firmware/default console. Linux
+     * amba-pl011 requires a clock, so expose a fixed 24MHz clock node.
+     */
+    clk_phandle = qemu_fdt_alloc_phandle(ms->fdt);
+    clk_name = g_strdup_printf("/soc/pclk@%"HWADDR_PRIx,
+                               s->memmap[VIRT_UART1].base);
+    qemu_fdt_add_subnode(ms->fdt, clk_name);
+    qemu_fdt_setprop_string(ms->fdt, clk_name, "compatible", "fixed-clock");
+    qemu_fdt_setprop_cell(ms->fdt, clk_name, "#clock-cells", 0x0);
+    qemu_fdt_setprop_cell(ms->fdt, clk_name, "clock-frequency", 24000000);
+    qemu_fdt_setprop_cell(ms->fdt, clk_name, "phandle", clk_phandle);
+
+    name = g_strdup_printf("/soc/serial@%"HWADDR_PRIx,
+                           s->memmap[VIRT_UART1].base);
+    qemu_fdt_add_subnode(ms->fdt, name);
+    /* Note we can't use setprop_string because of the embedded NUL */
+    qemu_fdt_setprop(ms->fdt, name, "compatible", compat, sizeof(compat));
+    qemu_fdt_setprop_sized_cells(ms->fdt, name, "reg",
+                                 2, s->memmap[VIRT_UART1].base,
+                                 2, s->memmap[VIRT_UART1].size);
+    qemu_fdt_setprop_cell(ms->fdt, name, "interrupt-parent", irq_mmio_phandle);
+    if (s->aia_type == VIRT_AIA_TYPE_NONE) {
+        qemu_fdt_setprop_cell(ms->fdt, name, "interrupts", UART1_IRQ);
+    } else {
+        qemu_fdt_setprop_cells(ms->fdt, name, "interrupts", UART1_IRQ, 0x4);
+    }
+    qemu_fdt_setprop_cells(ms->fdt, name, "clocks",
+                           clk_phandle, clk_phandle);
+    qemu_fdt_setprop(ms->fdt, name, "clock-names",
+                     clocknames, sizeof(clocknames));
+
+    qemu_fdt_setprop_string(ms->fdt, "/aliases", "serial1", name);
+}
+
 static void create_fdt_rtc(RISCVVirtState *s,
                            uint32_t irq_mmio_phandle)
 {
@@ -1140,6 +1188,8 @@ static void finalize_fdt(RISCVVirtState *s)
     create_fdt_reset(s, &phandle);
 
     create_fdt_uart(s, irq_mmio_phandle);
+
+    create_fdt_pl011(s, irq_mmio_phandle);
 
     create_fdt_rtc(s, irq_mmio_phandle);
 }
@@ -1696,6 +1746,9 @@ static void virt_machine_init(MachineState *machine)
     serial_mm_init(system_memory, s->memmap[VIRT_UART0].base,
         0, qdev_get_gpio_in(mmio_irqchip, UART0_IRQ), 399193,
         serial_hd(0), DEVICE_LITTLE_ENDIAN);
+
+    pl011_create(s->memmap[VIRT_UART1].base,
+        qdev_get_gpio_in(mmio_irqchip, UART1_IRQ), serial_hd(1));
 
     sysbus_create_simple("goldfish_rtc", s->memmap[VIRT_RTC].base,
         qdev_get_gpio_in(mmio_irqchip, RTC_IRQ));
